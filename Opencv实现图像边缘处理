@@ -6,7 +6,7 @@ while True:
     # 边缘检测（Canny算法）
     edges = cv2.Canny(frame, 100, 130)#测试不同阈值对结果的影响，发现低阈值可以保留更多细节但是噪声多，高阈值更干净但是细节不够
     cv2.imshow('Original', frame)
-    cv2.imshow('Edges', edges)Add commentMore actions
+    cv2.imshow('Edges', edges)
     if cv2.waitKey(1) == ord('q'):
         break
 cap.release()
