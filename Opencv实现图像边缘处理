@@ -1,13 +1,234 @@
-import cv2
-# 摄像头捕捉
-cap = cv2.VideoCapture(0)
-while True:
-    ret, frame = cap.read()
-    # 边缘检测（Canny算法）
-    edges = cv2.Canny(frame, 100, 130)#测试不同阈值对结果的影响，发现低阈值可以保留更多细节但是噪声多，高阈值更干净但是细节不够
-    cv2.imshow('Original', frame)
-    cv2.imshow('Edges', edges)
-    if cv2.waitKey(1) == ord('q'):
-        break
-cap.release()
-cv2.destroyAllWindows()
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+# 1. 数据读取与基础配置
+file_path = 'tiny_corpus_rnn.txt'
+
+with open(file_path, 'r', encoding='utf-8') as f:
+    TEXT = f.read()
+
+# 建立字符集与双向映射
+
+#set(TEXT)：对整个语料库 TEXT 进行去重，找出文本中所有出现过的、互不重复的字符。
+#sorted()：将去重后的字符按照 Unicode 编码顺序进行升序排序。
+#最终得到一个有序的字符列表 vocab
+vocab = sorted(set(TEXT))
+vocab_size = len(vocab)
+#stoi为每个字符分配一个唯一的、固定的数字编号（整数），从而搭建起从文本字符到张量计算的桥梁
+stoi = {}
+index = 0
+for ch in vocab:
+    stoi[ch] = index
+    index += 1
+itos = {}
+for i in range(len(vocab)):
+    itos[i] = vocab[i]
+
+# 将全文转换为对应的字符索引序列
+ids = [stoi[ch] for ch in TEXT]
+
+# 采用滑动窗口构建数据集（窗口长度 T=32，步长为 1）
+T = 32
+X_data = []
+Y_data = []
+for i in range(0, len(ids) - T - 1, 1):
+    X_data.append(ids[i : i+T])
+    Y_data.append(ids[i+1 : i+T+1])
+
+X_data = torch.tensor(X_data, dtype=torch.long)
+Y_data = torch.tensor(Y_data, dtype=torch.long)
+
+# 构建 DataLoader 批处理器
+dataset = torch.utils.data.TensorDataset(X_data, Y_data)
+dataloader = torch.utils.data.DataLoader(dataset, batch_size=128, shuffle=True, drop_last=True)
+
+# 打印数据集基础特征与文本片段预览
+print("数据集特征预览")
+print(f"语料总长度 (len(TEXT)): {len(TEXT)}")
+print(f"全词表大小 (vocab_size): {vocab_size}")
+print(f"前200字文本切片:\n{TEXT[:200]}")
+
+# 初始化词嵌入层并进行特征维度校验
+E = 32
+embedding_layer = nn.Embedding(vocab_size, E)
+dummy_x, _ = next(iter(dataloader))
+dummy_out = embedding_layer(dummy_x)
+print("Embedding 层表征维度校验")
+print(f"输入 Batch 形状 (B, T): {dummy_x.shape}")
+print(f"词嵌入输出张量形状 (B, T, E): {dummy_out.shape}")
+
+
+# 2. 手写 RNN Cell 与网络模型定义
+
+class MyRNNCell(nn.Module):
+    #input_size表示输入到RNN Cell中特征向量的维度
+    #hidden_size是指 RNN 内部用来存历史记忆的那个向量（隐藏状态ht）的长度
+    #这里的ht保存着在t时刻模型算出来的字符与上下文的关系的向量
+    def __init__(self, input_size, hidden_size):
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        
+        #torch.randn():在内存中分出大小为input_size*hidden_size的格子，
+        #在每个格子中填充一个大小为4字节的浮点数，同时这些浮点数满足标准正态分布
+        self.Wxh = nn.Parameter(torch.randn(input_size, hidden_size) * 0.02)
+        self.Whh = nn.Parameter(torch.randn(hidden_size, hidden_size) * 0.02)
+        self.bh = nn.Parameter(torch.zeros(hidden_size))
+        
+    def forward(self, x_t, h_prev):
+        #这里B表示批次大小,E为语义特征维度
+        B, E = x_t.shape
+        assert E == self.input_size, f"输入特征维度不匹配: {E} vs {self.input_size}"
+        assert h_prev.shape == (B, self.hidden_size), f"隐藏状态维度不匹配: {h_prev.shape}"
+        
+        h_t = torch.tanh(torch.matmul(x_t, self.Wxh) + torch.matmul(h_prev, self.Whh) + self.bh)
+        
+        assert h_t.shape == (B, self.hidden_size)
+        return h_t
+
+
+class CharRNN(nn.Module):
+    def __init__(self, vocab_size, embed_size, hidden_size):
+        super().__init__()
+        self.hidden_size = hidden_size
+        #生成一个vocab_size*embed_size的张量，其中存储着每一个字符以及其对应的语义特征
+        #同时这些字符的语义特征会不断更新
+        self.embedding = nn.Embedding(vocab_size, embed_size)
+        self.rnn_cell = MyRNNCell(embed_size, hidden_size)
+        #最终输出logits是一个形状为（B，vocab_size）的张量，存储着下一个待预测字的概率得分
+        #fc(in_feature,out_feature)
+        self.fc = nn.Linear(hidden_size, vocab_size)
+        
+    def forward(self, x, h_prev=None):
+        B, T = x.shape
+        embed = self.embedding(x)
+        
+        if h_prev is None:
+            h_prev = torch.zeros(B, self.hidden_size, device=x.device)
+            
+        outputs = []
+        h_t = h_prev
+        
+        for t in range(T):
+            #抠出第t个字，与embed[:,:t,:]范围切片函数不同,这里x_t的形状为B*E
+            x_t = embed[:, t, :]
+            h_t = self.rnn_cell(x_t, h_t)
+            #在位置为1的地方插入一个新维度
+            #output是一个长度为T的列表,里面的每个元素都是形状为（B，1，hidden_size）的张量
+            outputs.append(h_t.unsqueeze(1))
+            
+        #获得B个大小为T的字符切片中所有字符的隐藏状态
+        H_seq = torch.cat(outputs, dim=1)
+        
+        assert H_seq.shape == (B, T, self.hidden_size), f"序列状态形状异常: {H_seq.shape}"
+        #将H_seq最后一个维度hidden_size作为fc（）的输入，logits的形状为（B，T，vocab_size）
+        logits = self.fc(H_seq)
+        return logits, h_t
+
+
+# 3. 文本生成与采样逻辑
+def sample(model, seed_text, gen_len=200, temperature=1, device='cpu'):
+    #把模型从训练状态切换到测试状态
+    model.eval()
+    
+    with torch.no_grad():
+        #seed_text:提示词
+        chars = [ch for ch in seed_text]
+#在指定的计算设备（CPU 或 GPU）上，开辟一块全 0 的连续内存格子，作为 RNN 的初始隐藏状态,形状为(1,hidden_size）
+        h = torch.zeros(1, model.hidden_size, device=device)
+        
+        # 历史上下文载入
+        for ch in chars[:-1]:
+            if ch in stoi:
+                #x为1*1的张量，即这里的B，T都为1
+                x = torch.tensor([[stoi[ch]]], device=device)
+                
+                _, h = model(x, h)
+        
+        curr_ch = chars[-1]
+        for _ in range(gen_len):
+            if curr_ch not in stoi:
+                break
+            x = torch.tensor([[stoi[curr_ch]]], device=device)
+            logits, h = model(x, h)
+
+            #next_logit的形状为（vocab_size,）
+            #.clone(): 
+            #在内存中独立复制一份，彻底切断与原大张量 logits 的计算图关联
+            #使得原本庞大的旧 logits能被垃圾回收器及时销毁，防止 for 循环生成时显存爆炸(OOM)
+            next_logit = logits[0, -1, :].clone()
+            
+            # 过滤逻辑：保留中文、常见中英文标点、数字、字母与空格
+            for idx in range(len(itos)):
+                ch = itos[idx]
+                is_chinese = '\u4e00' <= ch <= '\u9fff'
+                is_chinese_punct = ch in ['，', '。', '、', '：', '（', '）', '；', '？', '！', '“', '”', '\n']
+                is_ascii_char = ch.isascii() and (ch.isalnum() or ch in [' ', '.', ',', '(', ')', '-', '_'])
+                
+                if not (is_chinese or is_chinese_punct or is_ascii_char):
+                    next_logit[idx] = -float('inf')
+            
+            # 防止全部被屏蔽导致 NaN
+            if torch.isinf(next_logit).all():
+                probs = torch.ones_like(next_logit) / len(itos)
+            else:
+                probs = torch.softmax(next_logit / temperature, dim=-1)
+                
+            #制作一个转盘,依据每个词的概率得分来分配转盘面积，只取一个结果
+            #item（）：将一个带有信息的张量转化为一个不带任何信息的元素
+            next_id = torch.multinomial(probs, num_samples=1).item()
+            curr_ch = itos[next_id]
+            chars.append(curr_ch)
+    
+    result = "".join(chars)
+    
+    sentence_endings = {'.', '!', '?', '。', '！', '？', '…', '”', '’', ')', '】', '」'}
+    if result and result[-1] not in sentence_endings:
+        # 如果末尾已经有换行符，先去掉换行再加省略号
+        result = result.rstrip('\n')
+        if result and result[-1] not in sentence_endings:
+            result += '…'
+    
+    return result
+
+
+# 4. 训练主循环
+def train():
+    device = 'cpu'
+    
+    model = CharRNN(vocab_size=vocab_size, embed_size=32, hidden_size=256).to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+    print("\n训练前文本采样测试")
+    print(sample(model, "人工智能", gen_len=200, temperature=1, device=device))
+   
+    global_step = 0
+    epochs = 15
+    print("开始执行训练循环...")
+
+    for epoch in range(epochs):
+        model.train()
+        for x_batch, y_batch in dataloader:
+            x_batch, y_batch = x_batch.to(device), y_batch.to(device)
+            
+            optimizer.zero_grad()
+            logits, _ = model(x_batch)
+
+            # 将三维预测值 (B, T, V) 变成二维 (B*T, V)，将二维标签 (B, T) 变成一维 (B*T,)
+            loss = criterion(logits.view(-1, vocab_size), y_batch.view(-1))
+            loss.backward()
+            
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            optimizer.step()
+            
+            if global_step % 50 == 0:
+                print(f"Epoch [{epoch+1}/{epochs}] Step {global_step}, Loss: {loss.item():.4f}")
+            global_step += 1
+
+    print("\n训练后生成文本测试")
+    print(sample(model, "人工智能", gen_len=200, temperature=1, device=device))
+
+if __name__ == "__main__":
+    train()
